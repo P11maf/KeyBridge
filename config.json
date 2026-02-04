@@ -1,0 +1,45 @@
+{
+  "tenantId": "leprino",
+  "siteId": "leprino_trial",
+  "pollSeconds": 1.0,
+  "firestore": {
+    "projectId": "iline-dev",
+    "serviceAccountPath": "serviceAccountKey.json",
+    "databaseId": "iline-production"
+  },
+  "retention": {
+    "raw_seconds_enabled": true,
+    "raw_seconds_window_minutes": 60,
+    "minute_rollups_enabled": true,
+    "minute_rollups_retention_enabled": true,
+    "minute_rollups_days": 90,
+    "hour_rollups_enabled": true,
+    "hour_rollups_years": 2,
+    "day_rollups_enabled": true,
+    "day_rollups_years": 5
+  },
+  "sqlite": {
+    "commit_every_seconds": 5,
+    "pragmas": {
+      "journal_mode": "WAL",
+      "synchronous": "NORMAL"
+    }
+  },
+  "simulate": {
+    "mirrorOutletFrom": "inlet",
+    "outlet": {
+      "meterId": "outlet",
+      "label": "Outlet (Simulated)",
+      "enabled": true
+    }
+  },
+  "devices": [
+    {
+      "meterId": "inlet",
+      "label": "Inlet",
+      "ip": "192.168.1.151",
+      "port": 502,
+      "enabled": true
+    }
+  ]
+}

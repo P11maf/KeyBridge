@@ -1,0 +1,117 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>KeyBridge Settings</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 16px; }
+    .card { border: 1px solid #ddd; border-radius: 10px; padding: 12px; margin-bottom: 12px; }
+    input { width: 100%; padding: 8px; margin: 4px 0; }
+    table { width: 100%; border-collapse: collapse; }
+    th, td { padding: 8px; border-bottom: 1px solid #eee; vertical-align: top; }
+    .row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+    .btn { padding: 10px 14px; border: 0; border-radius: 8px; cursor: pointer; }
+    .save { background: #0a7a0a; color: white; }
+    .err { color: #b00020; font-weight: bold; }
+    .small { color: #666; font-size: 0.9em; }
+    a { text-decoration: none; }
+
+    /* Option B: collapsible debug */
+    details { margin-top: 8px; }
+    summary { cursor: pointer; font-weight: bold; }
+    pre {
+      white-space: pre-wrap;
+      background: #f7f7f7;
+      border: 1px solid #ddd;
+      padding: 12px;
+      border-radius: 8px;
+      margin-top: 10px;
+    }
+  </style>
+</head>
+<body>
+
+  <h2>KeyBridge — Settings</h2>
+  <div class="small"><a href="/">← Back to dashboard</a></div>
+
+  {% if error %}
+    <div class="card err">{{ error }}</div>
+  {% endif %}
+
+  <form method="POST" class="card">
+    <div class="row">
+      <div>
+        <label><b>Site ID</b> (trial name)</label>
+        <input name="siteId" value="{{ cfg.siteId }}" placeholder="leprino_trial">
+      </div>
+      <div>
+        <label><b>Poll Seconds</b></label>
+        <input name="pollSeconds" value="{{ cfg.pollSeconds }}" type="number" min="1" max="60">
+      </div>
+    </div>
+
+    <h3>Meters / Devices</h3>
+    <div class="small">Use stable meterId values like <b>inlet</b> and <b>outlet</b>. IP/port are the MP-FEN1 network settings.</div>
+
+    <table>
+      <thead>
+        <tr>
+          <th>Enabled</th>
+          <th>meterId</th>
+          <th>Label</th>
+          <th>IP</th>
+          <th>Port</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for d in cfg.devices %}
+        <tr>
+          <td>
+            <input type="checkbox" name="enabled" value="{{ loop.index0 }}" {% if d.enabled %}checked{% endif %}>
+          </td>
+          <td><input name="meterId" value="{{ d.meterId }}"></td>
+          <td><input name="label" value="{{ d.label }}"></td>
+          <td><input name="ip" value="{{ d.ip }}"></td>
+          <td><input name="port" value="{{ d.port }}"></td>
+        </tr>
+        {% endfor %}
+
+        <!-- Empty row for adding a new device quickly -->
+        <tr>
+          <td><input type="checkbox" name="enabled" value="{{ cfg.devices|length }}" checked></td>
+          <td><input name="meterId" placeholder="outlet"></td>
+          <td><input name="label" placeholder="Factory Supply"></td>
+          <td><input name="ip" placeholder="192.168.1.152"></td>
+          <td><input name="port" value="502"></td>
+        </tr>
+      </tbody>
+    </table>
+
+    <button class="btn save" type="submit">Save & Apply</button>
+  </form>
+
+  <div class="card">
+    <h3>Notes</h3>
+    <ul>
+      <li>Changes apply live within the next poll cycle.</li>
+      <li>MP-FEN1 Modbus/TCP port is normally fixed at <b>502</b>.</li>
+    </ul>
+  </div>
+
+  <!-- Option B: Collapsible diagnostics -->
+  <div class="card">
+    <h3>Diagnostics</h3>
+    <div class="small">
+      Use this for troubleshooting only. You can also open the raw JSON in a new tab:
+      <a href="/debug" target="_blank"><b>/debug</b></a>
+    </div>
+
+    <details>
+      <summary>Show runtime/debug JSON</summary>
+      <pre>{{ latest | tojson(indent=2) }}</pre>
+    </details>
+  </div>
+
+</body>
+</html>

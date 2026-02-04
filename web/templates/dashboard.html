@@ -1,0 +1,164 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>KeyBridge Dashboard</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 24px; }
+    .ok { color: #0a7a0a; font-weight: bold; }
+    .bad { color: #b00020; font-weight: bold; }
+    .muted { color: #666; }
+    .card { border: 1px solid #ddd; border-radius: 8px; padding: 16px; margin: 12px 0; }
+    .row { display: flex; gap: 16px; flex-wrap: wrap; }
+    .col { flex: 1; min-width: 260px; }
+    ul { margin: 8px 0 0 20px; }
+    a { text-decoration: none; }
+    .pill { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 12px; margin-left: 8px; }
+    .pill.ok { background: #e7f7e7; color: #0a7a0a; }
+    .pill.bad { background: #fde7ea; color: #b00020; }
+
+    /* NEW: devices in a 2-column grid */
+    .device-grid {
+      display: grid;
+      grid-template-columns: repeat(2, 1fr);
+      gap: 16px;
+      align-items: start;
+    }
+    @media (max-width: 900px) {
+      .device-grid { grid-template-columns: 1fr; }
+    }
+    /* device cards don't need extra bottom margin when in grid */
+    .device-card { margin: 0; }
+  </style>
+</head>
+<body>
+
+  <h1>KeyBridge — Live Monitor</h1>
+
+  <div class="muted">
+    Last update (UTC): {{ state.updatedUtc if state.updatedUtc else state.lastCycleTs }} |
+    <a href="/settings">Settings</a>
+  </div>
+
+  <div class="card">
+    <div>
+      Firestore:
+      {% if state.firestoreOk %}
+        <span class="ok">OK</span>
+      {% else %}
+        <span class="bad">ERROR</span>
+        <span class="muted">{{ state.lastFirestoreError }}</span>
+      {% endif %}
+    </div>
+    <div>
+      Local DB:
+      {% if state.localDbOk %}
+        <span class="ok">OK</span>
+      {% else %}
+        <span class="bad">ERROR</span>
+        <span class="muted">{{ state.lastLocalDbError }}</span>
+      {% endif %}
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>Summary (inlet vs outlet)</h2>
+
+    {% if state.summary %}
+      <div class="muted">cycleTs: {{ state.summary.cycleTs }}</div>
+
+      <div style="margin-top: 8px;">
+        Sync:
+        {% if state.summary.quality and state.summary.quality.sync %}
+          <span class="pill ok">SYNC OK</span>
+        {% else %}
+          <span class="pill bad">NOT SYNCED</span>
+        {% endif %}
+
+        {% if state.summary.quality %}
+          <span class="muted">
+            inlet_ok={{ state.summary.quality.inlet_ok }},
+            outlet_ok={{ state.summary.quality.outlet_ok }}
+          </span>
+        {% endif %}
+      </div>
+
+      <div class="row" style="margin-top: 12px;">
+        <div class="col">
+          <h3>Inlet</h3>
+          {% if state.summary.inlet and state.summary.inlet.ok %}
+            <ul>
+              <li>flow_raw: {{ state.summary.inlet.flow_raw }}</li>
+              <li>total_raw: {{ state.summary.inlet.total_raw }}</li>
+              <li>delta: {{ state.summary.inlet.delta }}</li>
+            </ul>
+          {% else %}
+            <div class="bad">Not available</div>
+          {% endif %}
+        </div>
+
+        <div class="col">
+          <h3>Outlet</h3>
+          {% if state.summary.outlet and state.summary.outlet.ok %}
+            <ul>
+              <li>flow_raw: {{ state.summary.outlet.flow_raw }}</li>
+              <li>total_raw: {{ state.summary.outlet.total_raw }}</li>
+              <li>delta: {{ state.summary.outlet.delta }}</li>
+            </ul>
+          {% else %}
+            <div class="bad">Not available</div>
+          {% endif %}
+        </div>
+
+        <div class="col">
+          <h3>Loss</h3>
+          {% if state.summary.loss %}
+            <ul>
+              <li>delta: {{ state.summary.loss.delta }}</li>
+              <li>percent: {{ state.summary.loss.percent }}</li>
+              <li>basis: {{ state.summary.loss.basis }}</li>
+            </ul>
+          {% else %}
+            <div class="muted">No loss data</div>
+          {% endif %}
+        </div>
+      </div>
+    {% else %}
+      <div class="muted">No summary yet (need inlet + outlet OK).</div>
+    {% endif %}
+  </div>
+
+  <!-- NEW: Device cards in a 2-up grid -->
+  <div class="device-grid">
+    {% for meter_id, dev in state.devices.items() %}
+      <div class="card device-card">
+        <h2>{{ meter_id }} — {{ dev.label if dev.label else "" }}</h2>
+        <div class="muted">IP: {{ dev.ip }} | cycleTs: {{ dev.cycleTs }}</div>
+
+        {% if dev.ok %}
+          <div class="ok">Modbus: OK</div>
+          <ul>
+            <li>flow_raw: {{ dev.flow_raw }}</li>
+            <li>total_raw: {{ dev.total_raw }}</li>
+            <li>total_delta: {{ dev.total_delta }}</li>
+            <li>temp_raw: {{ dev.temp_raw }} ({{ dev.temp_c }} °C)</li>
+            <li>stability: {{ dev.stability }}</li>
+            <li>recording: {{ dev.recording }}</li>
+            <li>recordingSessionId: {{ dev.recordingSessionId }}</li>
+          </ul>
+        {% else %}
+          <div class="bad">Modbus: ERROR</div>
+          <div class="muted">{{ dev.error }}</div>
+        {% endif %}
+      </div>
+    {% endfor %}
+  </div>
+
+  <div class="muted" style="margin-top: 12px;">Auto-refresh every 2s.</div>
+  <script>
+    setTimeout(() => location.reload(), 2000);
+  </script>
+
+</body>
+</html>

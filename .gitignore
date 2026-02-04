@@ -1,0 +1,68 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+.env
+.venv
+venv/
+ENV/
+env/
+lib/
+*.sqlite3
+*.sqlite-shm
+*.sqlite-wal
+keybridge.sqlite*
+serviceAccountKey.json
+*.pem
+*.key
+*.crt
+.DS_Store
+.idea/
+.vscode/
+*.log
+
+# Byte-compiled / optimized / DLL files
+*/__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Editor directories and files
+.vscode/
+.idea/
+
+# Local virtualenv
+venv/
+ENV/
+env/
+.venv/
+
+# Mac
+.DS_Store
+
+# Windows
+Thumbs.db
+
+# Secrets
+.env
+secrets.json
+
+# Database
+*.db
+*.sqlite
+default.sqlite
+
+# Coverage
+htmlcov/
+.coverage
+
+# pytest
+.cache/
+
+# Flask uploads
+uploads/
