@@ -7,52 +7,80 @@
   <style>
     body { font-family: Arial, sans-serif; margin: 16px; }
     .card { border: 1px solid #ddd; border-radius: 10px; padding: 12px; margin-bottom: 12px; }
-    input { width: 100%; padding: 8px; margin: 4px 0; }
+    input, select { width: 100%; padding: 8px; margin: 4px 0; }
     table { width: 100%; border-collapse: collapse; }
     th, td { padding: 8px; border-bottom: 1px solid #eee; vertical-align: top; }
-    .row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+    .row { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 12px; }
     .btn { padding: 10px 14px; border: 0; border-radius: 8px; cursor: pointer; }
     .save { background: #0a7a0a; color: white; }
+    .muted { color: #666; font-size: 0.9em; }
     .err { color: #b00020; font-weight: bold; }
-    .small { color: #666; font-size: 0.9em; }
     a { text-decoration: none; }
-
-    /* Option B: collapsible debug */
-    details { margin-top: 8px; }
-    summary { cursor: pointer; font-weight: bold; }
-    pre {
-      white-space: pre-wrap;
-      background: #f7f7f7;
-      border: 1px solid #ddd;
-      padding: 12px;
-      border-radius: 8px;
-      margin-top: 10px;
-    }
+    .pill { display:inline-block; padding:2px 8px; border-radius:999px; background:#f3f3f3; font-size:12px; }
+    pre { white-space: pre-wrap; background: #f7f7f7; border: 1px solid #ddd; padding: 12px; border-radius: 8px; margin-top: 10px; max-height: 360px; overflow:auto; }
+    .small { font-size: 12px; }
   </style>
 </head>
 <body>
 
   <h2>KeyBridge — Settings</h2>
-  <div class="small"><a href="/">← Back to dashboard</a></div>
+  <div class="muted"><a href="/">← Back to dashboard</a></div>
 
   {% if error %}
     <div class="card err">{{ error }}</div>
   {% endif %}
 
   <form method="POST" class="card">
+
+    <h3>Identity</h3>
     <div class="row">
       <div>
-        <label><b>Site ID</b> (trial name)</label>
-        <input name="siteId" value="{{ cfg.siteId }}" placeholder="leprino_trial">
+        <label><b>Tenant ID</b></label>
+        <input name="tenantId" value="{{ cfg.tenantId or '' }}" placeholder="leprino">
+      </div>
+      <div>
+        <label><b>Site ID</b></label>
+        <input name="siteId" value="{{ cfg.siteId or '' }}" placeholder="leprino_trial">
+      </div>
+      <div>
+        <label><b>Gateway ID</b> <span class="pill">prevents overwrites</span></label>
+        <input name="gatewayId" value="{{ cfg.gatewayId or '' }}" placeholder="Pi-factory-in">
+      </div>
+    </div>
+
+    <h3>Run</h3>
+    <div class="row">
+      <div>
+        <label><b>Mode</b></label>
+        {% set m = (cfg.mode or "gateway") %}
+        <select name="mode">
+          <option value="gateway" {% if m=="gateway" %}selected{% endif %}>Gateway (publish meters)</option>
+          <option value="aggregator" {% if m=="aggregator" %}selected{% endif %}>Aggregator (summary/current only)</option>
+          <option value="both" {% if m=="both" %}selected{% endif %}>Both (Gateway + Aggregator)</option>
+        </select>
       </div>
       <div>
         <label><b>Poll Seconds</b></label>
-        <input name="pollSeconds" value="{{ cfg.pollSeconds }}" type="number" min="1" max="60">
+        <input name="pollSeconds" value="{{ cfg.pollSeconds or 1.0 }}" type="number" step="0.1" min="0.5" max="60">
+        <div class="muted">How often KeyBridge polls devices + writes latest (and raw samples).</div>
+      </div>
+      <div>
+        <label><b>SQLite commit every (seconds)</b></label>
+        <input
+          name="sqlite_commit_every_seconds"
+          value="{{ ((cfg.sqlite.commit_every_seconds if cfg.sqlite is defined and cfg.sqlite else None) or 5) }}"
+          type="number" step="1" min="1" max="60">
+        <div class="muted">Batch commits for performance.</div>
       </div>
     </div>
 
     <h3>Meters / Devices</h3>
-    <div class="small">Use stable meterId values like <b>inlet</b> and <b>outlet</b>. IP/port are the MP-FEN1 network settings.</div>
+    <div class="muted">
+      Each row is one local Modbus endpoint (MP-FEN1). Use stable unique meterIds (factory_inlet, efg_out, etc).
+      <span class="small">Tip: the “Enabled” checkbox is keyed by meterId.</span>
+    </div>
+
+    {% set devices = (cfg.devices or []) %}
 
     <table>
       <thead>
@@ -62,56 +90,132 @@
           <th>Label</th>
           <th>IP</th>
           <th>Port</th>
+          <th>Unit</th>
+          <th>Profile</th>
+          <th>Role</th>
+          <th>Source</th>
         </tr>
       </thead>
       <tbody>
-        {% for d in cfg.devices %}
+        {% for d in devices %}
         <tr>
-          <td>
-            <input type="checkbox" name="enabled" value="{{ loop.index0 }}" {% if d.enabled %}checked{% endif %}>
+          <td style="text-align:center">
+            <input
+              type="checkbox"
+              name="enabled_meterId"
+              value="{{ d.meterId }}"
+              {% if d.enabled %}checked{% endif %}>
           </td>
           <td><input name="meterId" value="{{ d.meterId }}"></td>
-          <td><input name="label" value="{{ d.label }}"></td>
-          <td><input name="ip" value="{{ d.ip }}"></td>
-          <td><input name="port" value="{{ d.port }}"></td>
+          <td><input name="label" value="{{ d.label or '' }}"></td>
+          <td><input name="ip" value="{{ d.ip or '' }}"></td>
+          <td><input name="port" value="{{ d.port or 502 }}"></td>
+          <td><input name="unitId" value="{{ d.unitId if d.unitId is defined else 1 }}"></td>
+          <td>
+            {% set p = (d.profile or "fd-r-v1") %}
+            <select name="profile">
+              <option value="fd-r-v1" {% if p=="fd-r-v1" %}selected{% endif %}>fd-r-v1</option>
+            </select>
+          </td>
+          <td>
+            {% set r = (d.role or "") %}
+            <select name="role">
+              <option value="" {% if r=="" %}selected{% endif %}>(none)</option>
+              <option value="inlet" {% if r=="inlet" %}selected{% endif %}>inlet</option>
+              <option value="outlet" {% if r=="outlet" %}selected{% endif %}>outlet</option>
+            </select>
+          </td>
+          <td>
+            {% set s = (d.source or "mp-fen1") %}
+            <select name="source">
+              <option value="mp-fen1" {% if s=="mp-fen1" %}selected{% endif %}>mp-fen1</option>
+              <option value="simulated" {% if s=="simulated" %}selected{% endif %}>simulated</option>
+            </select>
+          </td>
         </tr>
         {% endfor %}
 
-        <!-- Empty row for adding a new device quickly -->
+        <!-- Add row (blank) -->
         <tr>
-          <td><input type="checkbox" name="enabled" value="{{ cfg.devices|length }}" checked></td>
-          <td><input name="meterId" placeholder="outlet"></td>
-          <td><input name="label" placeholder="Factory Supply"></td>
+          <td style="text-align:center">
+            <!-- IMPORTANT: no 'd' here. Use __new__ so webapp.py can treat it as a new row -->
+            <input type="checkbox" name="enabled_meterId" value="__new__">
+          </td>
+          <td><input name="meterId" placeholder="efg_out"></td>
+          <td><input name="label" placeholder="EFG Out"></td>
           <td><input name="ip" placeholder="192.168.1.152"></td>
           <td><input name="port" value="502"></td>
+          <td><input name="unitId" value="1"></td>
+          <td>
+            <select name="profile">
+              <option value="fd-r-v1" selected>fd-r-v1</option>
+            </select>
+          </td>
+          <td>
+            <select name="role">
+              <option value="" selected>(none)</option>
+              <option value="inlet">inlet</option>
+              <option value="outlet">outlet</option>
+            </select>
+          </td>
+          <td>
+            <select name="source">
+              <option value="mp-fen1" selected>mp-fen1</option>
+              <option value="simulated">simulated</option>
+            </select>
+          </td>
         </tr>
       </tbody>
     </table>
+
+    <h3>Simulation (for testing)</h3>
+    {% set sim = (cfg.simulate or {}) %}
+    <div class="row">
+      <div>
+        <label><b>Enable synthetic simulation</b></label>
+        <select name="simulate_enabled">
+          <option value="false" {% if not sim.get("enabled") %}selected{% endif %}>false</option>
+          <option value="true" {% if sim.get("enabled") %}selected{% endif %}>true</option>
+        </select>
+        <div class="muted">Generates fake flow/total/temp when Modbus is offline.</div>
+      </div>
+      <div>
+        <label><b>Sim meterId</b></label>
+        <input name="simulate_meterId" value="{{ sim.get('meterId','sim_meter') }}" placeholder="sim_meter">
+      </div>
+      <div>
+        <label><b>Sim label</b></label>
+        <input name="simulate_label" value="{{ sim.get('label','Simulated Meter') }}" placeholder="Simulated Meter">
+      </div>
+    </div>
 
     <button class="btn save" type="submit">Save & Apply</button>
   </form>
 
   <div class="card">
-    <h3>Notes</h3>
-    <ul>
-      <li>Changes apply live within the next poll cycle.</li>
-      <li>MP-FEN1 Modbus/TCP port is normally fixed at <b>502</b>.</li>
-    </ul>
-  </div>
-
-  <!-- Option B: Collapsible diagnostics -->
-  <div class="card">
     <h3>Diagnostics</h3>
-    <div class="small">
-      Use this for troubleshooting only. You can also open the raw JSON in a new tab:
+    <div class="muted">
+      Use:
       <a href="/debug" target="_blank"><b>/debug</b></a>
     </div>
 
-    <details>
-      <summary>Show runtime/debug JSON</summary>
-      <pre>{{ latest | tojson(indent=2) }}</pre>
-    </details>
+    <button class="btn" type="button" onclick="loadDebug()">Load debug JSON</button>
+    <pre id="dbg">(click "Load debug JSON")</pre>
   </div>
+
+  <script>
+    async function loadDebug() {
+      const el = document.getElementById("dbg");
+      el.textContent = "Loading...";
+      try {
+        const r = await fetch("/debug");
+        const j = await r.json();
+        el.textContent = JSON.stringify(j, null, 2);
+      } catch (e) {
+        el.textContent = "Failed: " + e;
+      }
+    }
+  </script>
 
 </body>
 </html>

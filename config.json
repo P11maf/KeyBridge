@@ -1,6 +1,9 @@
 {
+  "version": 2,
   "tenantId": "leprino",
-  "siteId": "leprino_trial",
+  "siteId": "leprino",
+  "gatewayId": "Pi-factory-in",
+  "mode": "gateway",
   "pollSeconds": 1.0,
   "firestore": {
     "projectId": "iline-dev",
@@ -31,15 +34,41 @@
       "meterId": "outlet",
       "label": "Outlet (Simulated)",
       "enabled": true
-    }
+    },
+    "enabled": true,
+    "meterId": "sim_meter",
+    "label": "Simulated Meter"
   },
   "devices": [
     {
-      "meterId": "inlet",
-      "label": "Inlet",
+      "meterId": "factory_inlet",
+      "label": "EFG Factory Inlet",
       "ip": "192.168.1.151",
       "port": 502,
+      "unitId": 1,
+      "profile": "fd-r-v1",
+      "role": "inlet",
+      "source": "mp-fen1",
       "enabled": true
+    },
+    {
+      "meterId": "test",
+      "label": "test",
+      "ip": "192.168.1.152",
+      "port": 502,
+      "unitId": 1,
+      "profile": "fd-r-v1",
+      "role": "",
+      "source": "mp-fen1",
+      "enabled": false
     }
-  ]
+  ],
+  "summaryRules": {
+    "enabled": false,
+    "inletMeterId": "",
+    "outletMeterId": "",
+    "writePath": "summary/current",
+    "maxAgeSeconds": 10,
+    "requireSync": false
+  }
 }

@@ -2,7 +2,7 @@ import time
 from datetime import datetime, timezone, timedelta
 
 from keybridge.modbus import read_fd_r_via_mpfen1
-from keybridge.simulate import maybe_simulate_outlet
+from keybridge.simulate import simulate_meter
 
 from keybridge.db import (
     enqueue_raw_sample,
@@ -11,16 +11,18 @@ from keybridge.db import (
 )
 
 from keybridge.firestore_client import (
-    push_meter_latest,
+    push_meter_latest_guarded,
     push_summary_current,
     push_minute_rollup,
     delete_old_minute_rollups,
+    get_meter_latest,
+    push_gateway_heartbeat,
 )
 
 
 def _now_utc():
     dt = datetime.now(timezone.utc)
-    iso_plus00 = dt.isoformat()  # "+00:00"
+    iso_plus00 = dt.isoformat()
     iso_z = iso_plus00.replace("+00:00", "Z")
     return dt, iso_plus00, iso_z
 
@@ -36,7 +38,6 @@ def _safe_total_delta(prev_total, cur_total):
         delta = cur_total - prev_total
         if delta < 0:
             return None
-        # sanity cap per second (tune later)
         if delta > 10_000_000:
             return None
         return delta
@@ -81,6 +82,7 @@ def build_summary_current(cycle_ts_z: str, inlet_doc: dict, outlet_doc: dict) ->
             "temp_c": inlet_doc.get("temp_c"),
             "source": inlet_doc.get("source"),
             "error": inlet_doc.get("error"),
+            "gatewayId": inlet_doc.get("gatewayId"),
         },
         "outlet": {
             "ok": outlet_ok,
@@ -90,16 +92,18 @@ def build_summary_current(cycle_ts_z: str, inlet_doc: dict, outlet_doc: dict) ->
             "temp_c": outlet_doc.get("temp_c"),
             "source": outlet_doc.get("source"),
             "error": outlet_doc.get("error"),
+            "gatewayId": outlet_doc.get("gatewayId"),
         },
         "loss": {"delta": loss_delta, "percent": loss_percent, "basis": basis},
     }
 
 
-def _compute_minute_rollup_from_sqlite(db_conn, minute_start_utc: datetime, poll_seconds: float) -> dict:
-    """
-    Computes rollup from YOUR sqlite schema:
-      raw_samples(cycle_ts_utc, meter_id, flow_raw, total_raw, temp_c)
-    """
+def _compute_minute_rollup_from_sqlite(
+    db_conn,
+    minute_start_utc: datetime,
+    poll_seconds: float,
+    meter_ids: list[str],
+) -> dict:
     minute_start_utc = minute_start_utc.astimezone(timezone.utc).replace(second=0, microsecond=0)
     minute_end_utc = minute_start_utc + timedelta(minutes=1)
 
@@ -159,30 +163,7 @@ def _compute_minute_rollup_from_sqlite(db_conn, minute_start_utc: datetime, poll
             "temp_avg": temp_avg,
         }
 
-    inlet = per_meter("inlet")
-    outlet = per_meter("outlet")
-
-    # Loss
-    loss_delta = None
-    loss_percent = None
-    basis = "delta"
-
-    in_delta = inlet.get("total_delta")
-    out_delta = outlet.get("total_delta")
-
-    if in_delta is not None and out_delta is not None:
-        loss_delta = in_delta - out_delta
-        loss_percent = (loss_delta / in_delta) if in_delta else None
-        basis = "delta"
-    else:
-        in_flow = inlet.get("flow_avg")
-        out_flow = outlet.get("flow_avg")
-        if in_flow is not None and out_flow is not None:
-            loss_delta = in_flow - out_flow
-            loss_percent = (loss_delta / in_flow) if in_flow else None
-            basis = "flow_fallback"
-        else:
-            basis = "unknown"
+    meters = {mid: per_meter(mid) for mid in meter_ids}
 
     expected = None
     try:
@@ -198,31 +179,54 @@ def _compute_minute_rollup_from_sqlite(db_conn, minute_start_utc: datetime, poll
         "minuteStart": start_z,
         "minuteEnd": end_z,
         "expectedSamples": expected,
-        "inlet": inlet,
-        "outlet": outlet,
-        "loss": {"delta": loss_delta, "percent": loss_percent, "basis": basis},
+        "meters": meters,
     }
 
 
+def _choose_display_inlet_outlet(cfg: dict, meter_docs: dict) -> tuple[dict, dict]:
+    devices = cfg.get("devices", []) or []
+    rules = cfg.get("summaryRules", {}) or {}
+
+    inlet_id = (rules.get("inletMeterId") or "").strip()
+    outlet_id = (rules.get("outletMeterId") or "").strip()
+
+    if not inlet_id:
+        role_in = next((d for d in devices if d.get("enabled") and (d.get("role") == "inlet")), None)
+        inlet_id = (role_in.get("meterId") if role_in else "") or ""
+
+    if not outlet_id:
+        role_out = next((d for d in devices if d.get("enabled") and (d.get("role") == "outlet")), None)
+        outlet_id = (role_out.get("meterId") if role_out else "") or ""
+
+    enabled_ids = [d.get("meterId") for d in devices if d.get("enabled") and d.get("meterId")]
+    enabled_ids = [x for x in enabled_ids if x in meter_docs]
+
+    if not inlet_id and enabled_ids:
+        inlet_id = enabled_ids[0]
+    if not outlet_id and len(enabled_ids) > 1:
+        outlet_id = enabled_ids[1]
+
+    inlet_doc = meter_docs.get(inlet_id) or {"cycleTs": meter_docs.get("_cycleTs"), "ok": False, "error": "No inlet selected"}
+    outlet_doc = meter_docs.get(outlet_id) or {"cycleTs": meter_docs.get("_cycleTs"), "ok": False, "error": "No outlet selected"}
+
+    return inlet_doc, outlet_doc
+
+
 def poll_loop(db_conn, fs, latest: dict, recording_state: dict, last_totals: dict, get_config_live):
-    """
-    Main polling loop (thread target) for app.py.
-    Populates:
-      - latest.updatedUtc, latest.summary, latest.devices (for dashboard.html)
-      - debug_* fields (for /debug)
-      - minute rollups + retention
-    """
     latest["polling"] = True
     latest["lastPollError"] = None
 
     last_seen_minute = None
     last_retention_run = 0.0
+    last_heartbeat = 0.0
 
     while True:
         cfg = get_config_live()
 
-        tenant_id = cfg.get("tenantId")
-        site_id = cfg.get("siteId")
+        tenant_id = (cfg.get("tenantId") or "").strip()
+        site_id = (cfg.get("siteId") or "").strip()
+        gateway_id = (cfg.get("gatewayId") or "").strip() or "gateway-unknown"
+        mode = (cfg.get("mode") or "gateway").strip().lower()
         poll_seconds = float(cfg.get("pollSeconds", 1.0))
 
         retention_cfg = cfg.get("retention", {}) or {}
@@ -230,142 +234,224 @@ def poll_loop(db_conn, fs, latest: dict, recording_state: dict, last_totals: dic
         minute_rollups_retention_enabled = bool(retention_cfg.get("minute_rollups_retention_enabled", True))
         minute_rollups_days = int(retention_cfg.get("minute_rollups_days", 90))
 
+        summary_rules = cfg.get("summaryRules", {}) or {}
+        summary_enabled = bool(summary_rules.get("enabled", False))
+
+        sim_cfg = cfg.get("simulate", {}) or {}
+        sim_enabled = bool(sim_cfg.get("enabled", False))
+
         devices = cfg.get("devices", []) or []
-        inlet_dev = next((d for d in devices if d.get("enabled") and d.get("meterId") == "inlet"), None)
+        # ✅ allow simulated devices without IP
+        enabled_devices = [d for d in devices if d.get("enabled") and d.get("meterId")]
 
         dt_utc, cycle_ts_plus00, cycle_ts_z = _now_utc()
 
-        # Debug always-visible keys
         latest["debug_cycleTs"] = cycle_ts_z
-        latest["debug_inlet_ip"] = inlet_dev.get("ip") if inlet_dev else None
-        latest["debug_inlet_port"] = int(inlet_dev.get("port", 502)) if inlet_dev else None
-        latest["debug_sim_enabled"] = bool(((cfg.get("simulate", {}) or {}).get("outlet", {}) or {}).get("enabled", False))
         latest["debug_poll_seconds"] = poll_seconds
+        latest["debug_mode"] = mode
+        latest["debug_gatewayId"] = gateway_id
+        latest["debug_devices_enabled"] = [d.get("meterId") for d in enabled_devices]
 
         try:
-            # ---------------------------
-            # Read inlet (Modbus)
-            # ---------------------------
-            inlet_doc = {"cycleTs": cycle_ts_z, "source": "mp-fen1", "ok": False}
+            meter_docs: dict[str, dict] = {"_cycleTs": cycle_ts_z}
 
-            if not inlet_dev:
-                result = {"ok": False, "error": "No inlet device configured/enabled"}
-            else:
-                ip = inlet_dev.get("ip")
-                port = int(inlet_dev.get("port", 502))
-                result = read_fd_r_via_mpfen1(ip, port)
+            # HEARTBEAT
+            if fs:
+                now_s = time.time()
+                if (now_s - last_heartbeat) > 15.0:
+                    try:
+                        push_gateway_heartbeat(
+                            fs,
+                            tenant_id=tenant_id,
+                            gateway_id=gateway_id,
+                            site_id=site_id,
+                            status="ok",
+                            version="vNext",
+                            mode=mode,
+                            extra={"deviceCount": len(enabled_devices)},
+                        )
+                        latest["heartbeatOk"] = True
+                        latest["heartbeatUtc"] = cycle_ts_z
+                    except Exception as e:
+                        latest["heartbeatOk"] = False
+                        latest["heartbeatError"] = str(e)
+                    last_heartbeat = now_s
 
-            # Capture modbus result into debug
-            latest["debug_modbus_ok"] = bool(result.get("ok", False))
-            latest["debug_modbus_error"] = result.get("error")
-            latest["debug_modbus_keys"] = sorted(list(result.keys()))
+            # GATEWAY MODE
+            if mode in ("gateway", "both"):
+                latest.setdefault("debug_modbus", {})
+                latest.setdefault("firestoreMeterWrites", {})
 
-            inlet_doc.update(result)
-            inlet_doc["cycleTs"] = cycle_ts_z
-            inlet_doc["source"] = "mp-fen1"
-            inlet_doc["ok"] = bool(result.get("ok", False))
-            if not inlet_doc["ok"]:
-                inlet_doc["error"] = result.get("error", "Unknown Modbus error")
+                for d in enabled_devices:
+                    meter_id = (d.get("meterId") or "").strip()
+                    label = (d.get("label") or "").strip() or meter_id
+                    ip = (d.get("ip") or "").strip()
+                    port = int(d.get("port", 502))
+                    profile = (d.get("profile") or "fd-r-v1").strip()
+                    source = (d.get("source") or "mp-fen1").strip()
 
-            # total_delta
-            if inlet_doc.get("ok") and inlet_doc.get("total_raw") is not None:
-                prev = last_totals.get("inlet")
-                cur = inlet_doc.get("total_raw")
-                inlet_doc["total_delta"] = _safe_total_delta(prev, cur)
-                last_totals["inlet"] = cur
-            else:
-                inlet_doc["total_delta"] = None
+                    latest["debug_modbus"][meter_id] = {"ip": ip or None, "port": port, "ok": None, "error": None}
 
-            # ---------------------------
-            # Outlet (simulated for now)
-            # ---------------------------
-            outlet_doc = maybe_simulate_outlet(cfg, cycle_ts_z, inlet_doc) or {}
-            outlet_doc.setdefault("cycleTs", cycle_ts_z)
-            outlet_doc.setdefault("source", outlet_doc.get("source", "simulated"))
-            outlet_doc.setdefault("ok", bool(outlet_doc.get("ok", True)))
+                    doc = {
+                        "cycleTs": cycle_ts_z,
+                        "meterId": meter_id,
+                        "label": label,
+                        "source": source,
+                        "profile": profile,
+                        "gatewayId": gateway_id,
+                        "ok": False,
+                    }
 
-            if outlet_doc.get("total_raw") is not None:
-                prev = last_totals.get("outlet")
-                cur = outlet_doc.get("total_raw")
-                outlet_doc["total_delta"] = _safe_total_delta(prev, cur)
-                last_totals["outlet"] = cur
-            else:
-                outlet_doc["total_delta"] = None
+                    # ✅ NEW: per-device simulation support
+                    if source == "simulated":
+                        if not sim_enabled:
+                            result = {"ok": False, "error": "Simulation disabled (set simulate_enabled=true)."}
+                        else:
+                            result = simulate_meter(
+                                meter_id=meter_id,
+                                label=label,
+                                cycle_ts_z=cycle_ts_z,
+                                base_doc=None,
+                                loss_factor=0.98,
+                            )
+                    else:
+                        # real modbus
+                        if not ip:
+                            result = {"ok": False, "error": "Missing IP address"}
+                        elif profile != "fd-r-v1":
+                            result = {"ok": False, "error": f"Unsupported profile: {profile}"}
+                        else:
+                            result = read_fd_r_via_mpfen1(ip, port)
 
-            # ---------------------------
-            # Debug: why summary may be missing
-            # ---------------------------
-            latest["debug_inlet_doc_ok"] = bool(inlet_doc.get("ok", False))
-            latest["debug_inlet_flow_raw"] = inlet_doc.get("flow_raw")
-            latest["debug_outlet_doc_ok"] = bool(outlet_doc.get("ok", False))
-            latest["debug_outlet_flow_raw"] = outlet_doc.get("flow_raw")
-            latest["debug_summary_ready"] = (
-                bool(inlet_doc.get("ok", False)) and inlet_doc.get("flow_raw") is not None
-                and bool(outlet_doc.get("ok", False)) and outlet_doc.get("flow_raw") is not None
-            )
+                    doc.update(result)
+                    doc["ok"] = bool(doc.get("ok", False))
+                    if not doc["ok"]:
+                        doc["error"] = doc.get("error") or "Unknown error"
 
-            # ---------------------------
-            # SQLite raw samples (batch commit)
-            # ---------------------------
-            def to_row(meter_id: str, d: dict) -> dict:
-                return {
-                    "cycle_ts_utc": cycle_ts_plus00,
-                    "meter_id": meter_id,
-                    "flow_raw": d.get("flow_raw"),
-                    "total_raw": d.get("total_raw"),
-                    "temp_raw": d.get("temp_raw"),
-                    "temp_c": d.get("temp_c"),
-                    "stability": d.get("stability"),
-                    "module_status": d.get("module_status"),
-                    "data_status": d.get("data_status"),
-                    "diag_info": d.get("diag_info"),
-                    "event0_code": d.get("event0_code"),
-                    "data_valid": d.get("data_valid", True),
+                    if doc.get("ok") and doc.get("total_raw") is not None:
+                        prev = last_totals.get(meter_id)
+                        cur = doc.get("total_raw")
+                        doc["total_delta"] = _safe_total_delta(prev, cur)
+                        last_totals[meter_id] = cur
+                    else:
+                        doc["total_delta"] = None
+
+                    meter_docs[meter_id] = doc
+
+                    enqueue_raw_sample({
+                        "cycle_ts_utc": cycle_ts_plus00,
+                        "meter_id": meter_id,
+                        "flow_raw": doc.get("flow_raw"),
+                        "total_raw": doc.get("total_raw"),
+                        "temp_raw": doc.get("temp_raw"),
+                        "temp_c": doc.get("temp_c"),
+                        "stability": doc.get("stability"),
+                        "module_status": doc.get("module_status"),
+                        "data_status": doc.get("data_status"),
+                        "diag_info": doc.get("diag_info"),
+                        "event0_code": doc.get("event0_code"),
+                        "data_valid": doc.get("data_valid", True),
+                    })
+
+                    if fs:
+                        ok_write = push_meter_latest_guarded(
+                            fs,
+                            tenant_id=tenant_id,
+                            site_id=site_id,
+                            meter_id=meter_id,
+                            payload=doc,
+                            gateway_id=gateway_id,
+                            latest=latest,
+                        )
+                        latest["firestoreMeterWrites"][meter_id] = bool(ok_write)
+
+                    latest["debug_modbus"][meter_id]["ok"] = bool(doc.get("ok", False))
+                    latest["debug_modbus"][meter_id]["error"] = doc.get("error")
+
+                flush_db_if_needed(db_conn, cfg, latest)
+                apply_raw_retention(db_conn, cfg, cycle_ts_z, latest)
+
+            # AGGREGATOR MODE (optional)
+            inlet_for_summary = None
+            outlet_for_summary = None
+
+            if mode in ("aggregator", "both") and fs and tenant_id and site_id and summary_enabled:
+                inlet_id = (summary_rules.get("inletMeterId") or "").strip()
+                outlet_id = (summary_rules.get("outletMeterId") or "").strip()
+                max_age_s = int(summary_rules.get("maxAgeSeconds", 10))
+                require_sync = bool(summary_rules.get("requireSync", False))
+
+                inlet_for_summary = get_meter_latest(fs, tenant_id, site_id, inlet_id) if inlet_id else None
+                outlet_for_summary = get_meter_latest(fs, tenant_id, site_id, outlet_id) if outlet_id else None
+
+                def _age_ok(doc: dict | None) -> bool:
+                    if not doc:
+                        return False
+                    ts = doc.get("cycleTs")
+                    if not ts:
+                        return False
+                    try:
+                        dtp = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                        age = (datetime.now(timezone.utc) - dtp).total_seconds()
+                        return age <= max_age_s
+                    except Exception:
+                        return False
+
+                inlet_age_ok = _age_ok(inlet_for_summary)
+                outlet_age_ok = _age_ok(outlet_for_summary)
+                sync_ok = True
+                if require_sync and inlet_for_summary and outlet_for_summary:
+                    sync_ok = inlet_for_summary.get("cycleTs") == outlet_for_summary.get("cycleTs")
+
+                latest["aggregator"] = {
+                    "enabled": True,
+                    "inletMeterId": inlet_id,
+                    "outletMeterId": outlet_id,
+                    "inlet_age_ok": inlet_age_ok,
+                    "outlet_age_ok": outlet_age_ok,
+                    "sync_ok": sync_ok,
+                    "maxAgeSeconds": max_age_s,
+                    "requireSync": require_sync,
                 }
 
-            enqueue_raw_sample(to_row("inlet", inlet_doc))
-            enqueue_raw_sample(to_row("outlet", outlet_doc))
-            flush_db_if_needed(db_conn, cfg, latest)
-            apply_raw_retention(db_conn, cfg, cycle_ts_z, latest)
+                if inlet_for_summary and outlet_for_summary and inlet_age_ok and outlet_age_ok and sync_ok:
+                    sum_cycle = inlet_for_summary.get("cycleTs") or cycle_ts_z
+                    summary = build_summary_current(sum_cycle, inlet_for_summary, outlet_for_summary)
+                    push_summary_current(fs, tenant_id, site_id, summary)
+                    latest["lastFirestoreWriteUtc"] = cycle_ts_z
+                    latest["summaryWritten"] = True
+                else:
+                    latest["summaryWritten"] = False
 
-            # ---------------------------
-            # Dashboard runtime state (THIS is what your dashboard.html expects)
-            # ---------------------------
-            summary = build_summary_current(cycle_ts_z, inlet_doc, outlet_doc)
+            inlet_doc, outlet_doc = _choose_display_inlet_outlet(cfg, meter_docs)
+            summary_for_ui = build_summary_current(inlet_doc.get("cycleTs") or cycle_ts_z, inlet_doc, outlet_doc)
 
             latest["updatedUtc"] = cycle_ts_z
             latest["cycleTs"] = cycle_ts_z
-            latest["summary"] = summary
+            latest["summary"] = summary_for_ui
+
+            def _dev_meta(mid: str) -> dict:
+                dev = next((d for d in devices if d.get("meterId") == mid), None)
+                if not dev:
+                    return {"meterId": mid, "label": mid, "ip": None, "port": None}
+                return {
+                    "meterId": mid,
+                    "label": dev.get("label") or mid,
+                    "ip": dev.get("ip"),
+                    "port": int(dev.get("port", 502)) if dev.get("port") is not None else None,
+                }
+
+            inlet_mid = str(inlet_doc.get("meterId") or "inlet")
+            outlet_mid = str(outlet_doc.get("meterId") or "outlet")
 
             latest["devices"] = {
-                "inlet": {
-                    "meterId": "inlet",
-                    "label": (inlet_dev.get("label") if inlet_dev else "Inlet"),
-                    "ip": (inlet_dev.get("ip") if inlet_dev else None),
-                    "port": (int(inlet_dev.get("port", 502)) if inlet_dev else None),
-                    **inlet_doc,
-                },
-                "outlet": {
-                    "meterId": "outlet",
-                    "label": "Outlet",
-                    "ip": None,
-                    "port": None,
-                    **outlet_doc,
-                },
+                "inlet": {**_dev_meta(inlet_mid), **inlet_doc},
+                "outlet": {**_dev_meta(outlet_mid), **outlet_doc},
             }
 
-            # ---------------------------
-            # Firestore writes (live docs + summary/current)
-            # ---------------------------
-            if fs:
-                push_meter_latest(fs, tenant_id, site_id, "inlet", inlet_doc)
-                push_meter_latest(fs, tenant_id, site_id, "outlet", outlet_doc)
-                push_summary_current(fs, tenant_id, site_id, summary)
-                latest["lastFirestoreWriteUtc"] = cycle_ts_z
+            latest["meters"] = {k: v for k, v in meter_docs.items() if not k.startswith("_")}
 
-            # ---------------------------
-            # Minute rollups + retention
-            # ---------------------------
+            # MINUTE ROLLUPS
             if fs and minute_rollups_enabled:
                 cur_min = _floor_to_minute(dt_utc)
                 if last_seen_minute is None:
@@ -373,7 +459,22 @@ def poll_loop(db_conn, fs, latest: dict, recording_state: dict, last_totals: dic
 
                 if cur_min > last_seen_minute:
                     minute_start = last_seen_minute
-                    rollup = _compute_minute_rollup_from_sqlite(db_conn, minute_start, poll_seconds=poll_seconds)
+
+                    meter_ids_for_rollup = []
+                    for d in devices:
+                        mid = (d.get("meterId") or "").strip()
+                        if mid:
+                            meter_ids_for_rollup.append(mid)
+                    for mid in latest.get("meters", {}).keys():
+                        if mid and mid not in meter_ids_for_rollup:
+                            meter_ids_for_rollup.append(mid)
+
+                    rollup = _compute_minute_rollup_from_sqlite(
+                        db_conn,
+                        minute_start,
+                        poll_seconds=poll_seconds,
+                        meter_ids=meter_ids_for_rollup,
+                    )
                     push_minute_rollup(fs, tenant_id, site_id, rollup["minuteStart"], rollup)
                     last_seen_minute = cur_min
 

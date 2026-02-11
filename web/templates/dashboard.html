@@ -17,8 +17,8 @@
     .pill { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 12px; margin-left: 8px; }
     .pill.ok { background: #e7f7e7; color: #0a7a0a; }
     .pill.bad { background: #fde7ea; color: #b00020; }
+    .pill.muted { background: #f2f2f2; color: #444; }
 
-    /* NEW: devices in a 2-column grid */
     .device-grid {
       display: grid;
       grid-template-columns: repeat(2, 1fr);
@@ -28,8 +28,14 @@
     @media (max-width: 900px) {
       .device-grid { grid-template-columns: 1fr; }
     }
-    /* device cards don't need extra bottom margin when in grid */
     .device-card { margin: 0; }
+
+    .conflict {
+      border-left: 6px solid #b00020;
+      background: #fff7f8;
+    }
+
+    code { background: #f2f2f2; padding: 2px 6px; border-radius: 6px; }
   </style>
 </head>
 <body>
@@ -38,7 +44,30 @@
 
   <div class="muted">
     Last update (UTC): {{ state.updatedUtc if state.updatedUtc else state.lastCycleTs }} |
-    <a href="/settings">Settings</a>
+    <a href="/settings">Settings</a> |
+    <a href="/debug" target="_blank">Debug JSON</a>
+  </div>
+
+  <div class="card">
+    <div>
+      Mode:
+      <span class="pill muted">{{ state.debug_mode if state.debug_mode else "unknown" }}</span>
+      Gateway:
+      <span class="pill muted">{{ state.debug_gatewayId if state.debug_gatewayId else "unknown" }}</span>
+    </div>
+
+    {% if state.heartbeatOk is not none %}
+      <div style="margin-top: 8px;">
+        Heartbeat:
+        {% if state.heartbeatOk %}
+          <span class="ok">OK</span>
+          <span class="muted">({{ state.heartbeatUtc }})</span>
+        {% else %}
+          <span class="bad">ERROR</span>
+          <span class="muted">{{ state.heartbeatError }}</span>
+        {% endif %}
+      </div>
+    {% endif %}
   </div>
 
   <div class="card">
@@ -61,6 +90,25 @@
       {% endif %}
     </div>
   </div>
+
+  {% if state.ownershipConflicts and state.ownershipConflicts|length > 0 %}
+    <div class="card conflict">
+      <h2>Ownership conflicts detected</h2>
+      <div class="muted">
+        This gateway refused to overwrite meterIds owned by another gatewayId.
+        Fix by ensuring each Pi uses unique <code>meterId</code> values, or correct the <code>gatewayId</code>.
+      </div>
+      <ul>
+        {% for c in state.ownershipConflicts[-8:] %}
+          <li>
+            meterId=<b>{{ c.meterId }}</b> existingGatewayId=<b>{{ c.existingGatewayId }}</b>
+            thisGatewayId=<b>{{ c.thisGatewayId }}</b>
+            <span class="muted">({{ c.ts }})</span>
+          </li>
+        {% endfor %}
+      </ul>
+    </div>
+  {% endif %}
 
   <div class="card">
     <h2>Summary (inlet vs outlet)</h2>
@@ -129,12 +177,16 @@
     {% endif %}
   </div>
 
-  <!-- NEW: Device cards in a 2-up grid -->
+  <!-- Back-compat: inlet/outlet device cards -->
   <div class="device-grid">
     {% for meter_id, dev in state.devices.items() %}
       <div class="card device-card">
         <h2>{{ meter_id }} — {{ dev.label if dev.label else "" }}</h2>
-        <div class="muted">IP: {{ dev.ip }} | cycleTs: {{ dev.cycleTs }}</div>
+        <div class="muted">
+          IP: {{ dev.ip }} |
+          cycleTs: {{ dev.cycleTs }} |
+          gatewayId: {{ dev.gatewayId if dev.gatewayId else "" }}
+        </div>
 
         {% if dev.ok %}
           <div class="ok">Modbus: OK</div>
@@ -146,6 +198,7 @@
             <li>stability: {{ dev.stability }}</li>
             <li>recording: {{ dev.recording }}</li>
             <li>recordingSessionId: {{ dev.recordingSessionId }}</li>
+            <li>source: {{ dev.source }}</li>
           </ul>
         {% else %}
           <div class="bad">Modbus: ERROR</div>
@@ -154,6 +207,40 @@
       </div>
     {% endfor %}
   </div>
+
+  {% if state.meters %}
+    <div class="card">
+      <h2>All meters (vNext)</h2>
+      <div class="muted">This is the full list of locally-read meters this cycle.</div>
+
+      <div class="device-grid" style="margin-top: 12px;">
+        {% for meter_id, dev in state.meters.items() %}
+          <div class="card device-card">
+            <h3>{{ meter_id }} — {{ dev.label if dev.label else "" }}</h3>
+            <div class="muted">
+              IP: {{ dev.ip if dev.ip else "" }} |
+              cycleTs: {{ dev.cycleTs }} |
+              gatewayId: {{ dev.gatewayId if dev.gatewayId else "" }}
+            </div>
+
+            {% if dev.ok %}
+              <div class="ok">OK</div>
+              <ul>
+                <li>flow_raw: {{ dev.flow_raw }}</li>
+                <li>total_raw: {{ dev.total_raw }}</li>
+                <li>total_delta: {{ dev.total_delta }}</li>
+                <li>temp_c: {{ dev.temp_c }}</li>
+                <li>source: {{ dev.source }}</li>
+              </ul>
+            {% else %}
+              <div class="bad">ERROR</div>
+              <div class="muted">{{ dev.error }}</div>
+            {% endif %}
+          </div>
+        {% endfor %}
+      </div>
+    </div>
+  {% endif %}
 
   <div class="muted" style="margin-top: 12px;">Auto-refresh every 2s.</div>
   <script>
